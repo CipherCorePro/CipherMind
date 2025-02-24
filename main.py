@@ -1,289 +1,127 @@
+# Import der benötigten Bibliotheken und Module
+import logging                      # Für Logging-Zwecke
+import torch                        # PyTorch-Bibliothek für Deep Learning
+import torch.nn as nn               # Enthält Module und Klassen für neuronale Netze
+import torch.nn.functional as F     # Funktionale Schnittstelle für Aktivierungen und mehr
+import torch.optim as optim         # Optimierungsalgorithmen wie Adam
+from torch.utils.data import DataLoader, Dataset, random_split  # Datenhandling in PyTorch
+import re                           # Reguläre Ausdrücke für die Tokenisierung
+from dataclasses import dataclass, field, asdict  # Moderne Python Data Classes (ab Python 3.7)
+import random                       # Für zufallsbasierte Prozesse
+import numpy as np                  # Numerische Berechnungen mit Arrays
+import yaml                         # YAML-Format (z.B. für Konfigurationen)
+from sklearn.metrics import accuracy_score, f1_score  # Metriken zur Evaluierung
+import matplotlib.pyplot as plt     # Plotten von Trainingskurven
+import optuna                       # Für Hyperparameter-Optimierung (optional)
+from tqdm import tqdm               # Fortschrittsanzeige für Schleifen
+import os                           # Betriebssystemfunktionen, z.B. zum Erstellen von Verzeichnissen
 
-# DRLMemNet - Framework für Deep Reinforcement Learning mit speicherbasierten Netzwerkarchitekturen
-# Copyright (C) 2024 Ralf Krümmel
-# Projekt-Repository: https://github.com/kruemmel-python/DRLMemNet.git
-#
-# Dieses Programm ist freie Software: Sie können es unter den Bedingungen der
-# GNU General Public License, Version 3, wie von der Free Software Foundation veröffentlicht,
-# weitergeben und/oder modifizieren.
-#
-# Dieses Programm wird in der Hoffnung verteilt, dass es nützlich sein wird, 
-# aber OHNE JEGLICHE GARANTIE; sogar ohne die implizite Garantie der 
-# MARKTGÄNGIGKEIT oder EIGNUNG FÜR EINEN BESTIMMTEN ZWECK.  
-# Siehe die GNU General Public License für weitere Details.
-import logging
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
-from typing import List, Tuple, Dict, Iterator
-import re
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-import random
-import numpy as np
-from tqdm import tqdm
-import yaml
-from sklearn.metrics import accuracy_score, f1_score
-import matplotlib.pyplot as plt
-import optuna
+# Debug-Modus aktivieren – nützlich während der Entwicklung, um zusätzliche Informationen zu erhalten
+DEBUG_MODE = True
 
-# Debug-Modus
-DEBUG_MODE = False
-
-# Konstanten
+# Definition von speziellen Token-Indexen für Padding, unbekannte Tokens, Start- und End-Symbol
 PAD_INDEX = 0
 UNK_INDEX = 1
 SOS_INDEX = 2
 EOS_INDEX = 3
 
-# --------------------------------------------------
-# 1) Konfigurationsklasse mit load_config
-# --------------------------------------------------
+
+# -------------------------------------------------------------------------------------------------------------------
+# Konfigurationsklasse: Hier werden alle wichtigen Hyperparameter und Pfade zentral definiert.
+# Die Verwendung einer Data Class (seit Python 3.7) sorgt für sauberen und übersichtlichen Code.
 @dataclass
 class Config:
-    data_path: str = None
-    log_file: str = "training.log"
-    embedding_dim: int = None
-    memory_size: int = None
-    learning_rate: float = None
-    batch_size: int = None
-    max_seq_length: int = None
-    train_size_ratio: float = None
-    val_size_ratio: float = None
-    epochs: int = None
-    accumulation_steps: int = None
-    write_strength: float = None
-    patience: int = None
-    save_path: str = None
-    device: torch.device = field(init=False)
+    data_path: str = "dataset.txt"         # Pfad zur Datendatei
+    log_file: str = "training.log"           # Protokolldatei für Trainingsausgaben
+    embedding_dim: int = 256                 # Dimension der Einbettungsvektoren
+    memory_size: int = 512                   # Größe des differentiable memory
+    learning_rate: float = 0.001             # Lernrate für den Optimierer
+    batch_size: int = 32                     # Anzahl der Samples pro Batch
+    max_seq_length: int = 50                 # Maximale Länge der Sequenzen
+    train_size_ratio: float = 0.8            # Anteil der Trainingsdaten
+    val_size_ratio: float = 0.1              # Anteil der Validierungsdaten
+    epochs: int = 10                         # Anzahl der Trainingsepochen
+    accumulation_steps: int = 1              # Schritte für Gradientenakkumulation (bei Bedarf)
+    write_strength: float = 0.1              # Stärke des Updates beim Schreiben in den Speicher
+    patience: int = 5                        # Geduld für frühes Stoppen (falls implementiert)
+    save_path: str = "models/"               # Pfad zum Speichern von Modellen
+    load_model: bool = False                 # Flag zum Laden eines bereits gespeicherten Modells
+    plot_path: str = "training_plots/"       # Pfad zum Speichern der Trainingsplots
+    device: torch.device = field(init=False) # Gerät (CPU oder GPU), wird im __post_init__ festgelegt
 
+    # Nachinitialisierung: Hier wird das passende Gerät ausgewählt und notwendige Verzeichnisse werden erstellt.
     def __post_init__(self):
-        """
-        Der Konstruktor wird nach der Initialisierung aufgerufen und setzt das Gerät
-        (CPU oder GPU) entsprechend der verfügbaren Hardware.
-        """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Gerät: {self.device}")
+        os.makedirs(self.save_path, exist_ok=True)
+        os.makedirs(self.plot_path, exist_ok=True)
 
-    def load_config(self, config_source: str | dict = "config.yaml"):
-        """
-        Lädt die Konfiguration entweder aus einer YAML-Datei (Pfad als str)
-        oder direkt aus einem Dictionary, z. B. study.best_params.
 
-        Durch strukturelles Pattern Matching können wir die Eingaben
-        in unterschiedlichen Fällen behandeln.
-        """
-        match config_source:
-            case str() as path:  # Falls der Nutzer einen Pfad (String) übergibt
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        config_yaml = yaml.safe_load(f)
-                        print(f"Konfiguration aus Datei '{path}' geladen: {config_yaml}")
-                        for key, value in config_yaml.items():
-                            if hasattr(self, key):
-                                setattr(self, key, value)
-                            else:
-                                logging.warning(f"Unbekannte Konfigurations-Option: {key}")
-                    self._validate_config()
-                except Exception as e:
-                    logging.error(f"Fehler beim Laden der Konfiguration: {e}")
-                    raise
-
-            case dict() as param_dict:  # Falls ein Dictionary (z. B. study.best_params) übergeben wird
-                print(f"Konfiguration aus Dictionary geladen: {param_dict}")
-                for key, value in param_dict.items():
-                    if hasattr(self, key):
-                        setattr(self, key, value)
-                    else:
-                        logging.warning(f"Unbekannte Konfigurations-Option: {key}")
-                self._validate_config()
-
-            case _:
-                raise TypeError(
-                    f"Unsupported config source type: {type(config_source).__name__}. "
-                    f"Erwartet wurde str (Dateipfad) oder dict (Parameter)."
-                )
-
-    def _validate_config(self):
-        """
-        Stellt sicher, dass alle wichtigen Felder gesetzt und gültig sind.
-        Wir brechen ab, falls eine fehlerhafte Konfiguration vorliegt.
-        """
-        if self.learning_rate is None or self.learning_rate <= 0:
-            raise ValueError("Lernrate muss positiv sein.")
-        if self.batch_size is None or self.batch_size <= 0:
-            raise ValueError("Batch-Größe muss positiv sein.")
-        if self.train_size_ratio is None or self.val_size_ratio is None:
-            raise ValueError("Train & Val Ratio nicht definiert.")
-        if not (0 < self.train_size_ratio < 1) or not (0 <= self.val_size_ratio < 1) or (self.train_size_ratio + self.val_size_ratio >= 1):
-            raise ValueError("Train & Val Ratio müssen zwischen 0 und 1 liegen und kleiner als 1 sein.")
-
-    def save_config(self) -> Dict:
-        """Sichert relevante Konfigurationsattribute in einem Dict."""
-        return asdict(self)
-
-# --------------------------------------------------
-# 2) Konfiguration laden (erste Datei-Ladung aus config.yaml)
-# --------------------------------------------------
-with open("config.yaml", "r", encoding="utf-8") as f:
-    config_data = yaml.safe_load(f)
-CONFIG = Config(**config_data)
-
-# Gerät
-DEVICE = CONFIG.device
-
-# Logging
-logging.basicConfig(
-    filename=CONFIG.log_file,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filemode='w'
-)
-logger = logging.getLogger(__name__)  # Logger
-
-# Seed setzen für Reproduzierbarkeit
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-set_seed(42)
-print("Seed gesetzt.")
-
-# --------------------------------------------------
-# 3) Klassen und Funktionen: DifferentiableMemory, Controller, Vokabular, Dataset
-# --------------------------------------------------
+# -------------------------------------------------------------------------------------------------------------------
+# DifferentiableMemory: Implementiert einen Speicher, der als Parameter im Modell geführt wird.
+# Dies ermöglicht es, während des Trainings differentiable (ableitbare) Lese- und Schreiboperationen durchzuführen.
 class DifferentiableMemory(nn.Module):
-    """
-    Eine einfache Implementierung eines differenzierbaren Speichers.
-    Enthält Keys und Values, die beim Lesen und Schreiben aktualisiert werden.
-    """
-    def __init__(self, memory_size: int, embedding_size: int, device=DEVICE):
-        super(DifferentiableMemory, self).__init__()
+    def __init__(self, memory_size: int, embedding_size: int, device):
+        super().__init__()
+        # Initialisiert zufällige Schlüssel und Werte als Parameter (trainierbar)
         self.keys = nn.Parameter(torch.randn(memory_size, embedding_size, device=device))
         self.values = nn.Parameter(torch.randn(memory_size, embedding_size, device=device))
-        self.embedding_size = embedding_size
-        self.memory_size = memory_size
         self.device = device
-        self._initialize_weights()
-        self.usage_counts = nn.Parameter(torch.ones(memory_size, device=device), requires_grad=False)
+        self.memory_size = memory_size
 
-    def _initialize_weights(self):
-        nn.init.kaiming_uniform_(self.keys)
-        nn.init.kaiming_uniform_(self.values)
-
+    # Leseoperation: Berechnet Ähnlichkeitswerte zwischen Abfrage (query) und den Schlüsseln, 
+    # wendet Softmax an und gibt eine gewichtete Summe der Werte zurück.
     def read(self, query: torch.Tensor) -> torch.Tensor:
         scores = torch.matmul(query, self.keys.T)
         attention_weights = F.softmax(scores, dim=-1)
-        memory_output = torch.matmul(attention_weights, self.values)
+        return torch.matmul(attention_weights, self.values)
 
-        activated_memory_indices = torch.argmax(scores, dim=-1)
-        self.usage_counts[activated_memory_indices] += 1
-        return memory_output
-
+    # Schreiboperation: Aktualisiert die Schlüssel und Werte basierend auf neuen Werten.
+    # Die Aktualisierungen werden normalisiert und über einen Write-Strength-Faktor gemischt.
     def write(self, updated_keys: torch.Tensor, updated_values: torch.Tensor, write_strength: float):
         updated_keys = F.normalize(updated_keys, dim=-1)
         updated_values = F.normalize(updated_values, dim=-1)
-
-        batch_size = updated_keys.shape[0]
-        if batch_size != self.memory_size:
-            updated_keys = updated_keys.mean(dim=0, keepdim=True).expand(self.memory_size, -1)
-            updated_values = updated_values.mean(dim=0, keepdim=True).expand(self.memory_size, -1)
-
         with torch.no_grad():
-            self.keys.copy_((1 - write_strength) * self.keys.data + write_strength * updated_keys)
-            self.values.copy_((1 - write_strength) * self.values.data + write_strength * updated_values)
+            self.keys.copy_((1 - write_strength) * self.keys + write_strength * updated_keys)
+            self.values.copy_((1 - write_strength) * self.values + write_strength * updated_values)
 
-            self.keys.copy_(F.normalize(self.keys, dim=1))
-            self.values.copy_(F.normalize(self.values, dim=1))
 
-        if DEBUG_MODE:
-            print("Aktualisierte Memory-Parameter (write).")
-
-    def write_as_mean(self, updated_keys: torch.Tensor, updated_values: torch.Tensor, write_strength: float):
-        updated_keys = F.normalize(updated_keys, dim=-1)
-        updated_values = F.normalize(updated_values, dim=-1)
-
-        with torch.no_grad():
-            mean_keys = updated_keys.mean(dim=0, keepdim=True)
-            mean_values = updated_values.mean(dim=0, keepdim=True)
-
-            self.keys.copy_((1 - write_strength) * self.keys.data + write_strength * mean_keys)
-            self.values.copy_((1 - write_strength) * self.values.data + write_strength * mean_values)
-
-            self.keys.copy_(F.normalize(self.keys, dim=1))
-            self.values.copy_(F.normalize(self.values, dim=1))
-
-        if DEBUG_MODE:
-            print("Aktualisierte Memory-Parameter (write_as_mean).")
-
+# -------------------------------------------------------------------------------------------------------------------
+# Controller: Das Hauptmodell, das den differentiable memory, ein Embedding-Layer, ein RNN (GRU) und einen fully-connected
+# Layer kombiniert, um Texteingaben in Vorhersagen (Wortwahrscheinlichkeiten) umzuwandeln.
 class Controller(nn.Module):
-    """
-    Das Hauptmodell, welches die Memory-Komponente nutzt.
-    """
-    def __init__(self, embedding_size: int, memory_embedding_size: int, vocab_size: int, memory_size: int, device: torch.device = DEVICE):
-        super(Controller, self).__init__()
-        self.memory = DifferentiableMemory(memory_size, memory_embedding_size, device)
+    def __init__(self, embedding_size: int, memory_size: int, vocab_size: int, device):
+        super().__init__()
+        # Initialisierung des differentiable memory
+        self.memory = DifferentiableMemory(memory_size, embedding_size, device)
+        # Embedding-Layer wandelt Token-IDs in dichte Vektorrepräsentationen um
         self.embedding = nn.Embedding(vocab_size, embedding_size)
-        self.fc_query = nn.Linear(embedding_size, memory_embedding_size)
-        self.fc_query_act = nn.GELU()
-        self.rnn = nn.GRU(memory_embedding_size, 256, num_layers=2, batch_first=True)
-        self.fc1 = nn.Linear(256, 256)
-        self.fc1_act = nn.GELU()
-        self.dropout = nn.Dropout(0.3)
+        # GRU: Rekurrentes neuronales Netz, hier mit 2 Schichten, um Sequenzinformationen zu verarbeiten
+        self.rnn = nn.GRU(embedding_size, 256, num_layers=2, batch_first=True)
+        # Fully-connected Layer, der den RNN-Ausgang in Vokabular-Größen (Wortwahrscheinlichkeiten) überführt
         self.fc_output = nn.Linear(256, vocab_size)
-        self.fc_output_act = nn.GELU()
-
-        # Memory-Aktualisierung
-        self.fc_query_memory = nn.Linear(memory_embedding_size, memory_embedding_size)
-        self.fc_query_memory_act = nn.GELU()
-        self.fc_value_memory = nn.Linear(vocab_size, memory_embedding_size)
-        self.fc_value_memory_act = nn.GELU()
-
         self.device = device
-        self._init_layers()
 
-    def _init_layers(self):
-        nn.init.kaiming_uniform_(self.fc_query.weight)
-        nn.init.zeros_(self.fc_query.bias)
-        nn.init.kaiming_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.kaiming_uniform_(self.fc_output.weight)
-        nn.init.zeros_(self.fc_output.bias)
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.1)
-
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Vorwärtsdurchlauf: In diesem Schritt werden die Eingaben zuerst eingebettet, 
+    # anschließend wird der differentiable memory gelesen und das RNN verarbeitet die Speicherrepräsentation.
+    def forward(self, inputs: torch.Tensor):
         embedded = self.embedding(inputs)
-        query = self.fc_query(embedded)
-        query = self.fc_query_act(query)
-
-        memory_output = self.memory.read(query)
-
+        memory_output = self.memory.read(embedded)
         rnn_output, _ = self.rnn(memory_output)
-        hidden = self.fc1(rnn_output)
-        hidden = self.fc1_act(hidden)
-        hidden = self.dropout(hidden)
+        return self.fc_output(rnn_output), memory_output
 
-        output = self.fc_output(hidden)
-        output = self.fc_output_act(output)
-        return output, query
 
+# -------------------------------------------------------------------------------------------------------------------
+# Vocabulary: Eine einfache Klasse zur Verwaltung von Token-IDs.
+# Neben dem Hinzufügen von Tokens ermöglicht sie auch den Rückgriff auf die Originaltokens anhand des Index.
 class Vocabulary:
-    """
-    Verwaltet die Abbildung von Token -> Index und Index -> Token.
-    """
     def __init__(self, special_tokens=None):
         self.token_to_index = {}
         self.index_to_token = []
-        self.special_tokens = special_tokens if special_tokens else []
-        for token in self.special_tokens:
+        # Falls spezielle Tokens (wie Padding, SOS, EOS) angegeben werden, werden diese zuerst hinzugefügt.
+        for token in special_tokens or []:
             self.add_token(token)
-        self.unk_index = self.token_to_index.get("<unk>", 0)
 
+    # Fügt ein neues Token hinzu, sofern es noch nicht vorhanden ist.
     def add_token(self, token):
         if token not in self.token_to_index:
             self.token_to_index[token] = len(self.index_to_token)
@@ -292,507 +130,275 @@ class Vocabulary:
     def __len__(self):
         return len(self.token_to_index)
 
+    # Gibt die ID für ein Token zurück oder den UNK_INDEX, falls das Token nicht im Vokabular ist.
     def __getitem__(self, token):
-        return self.token_to_index.get(token, self.unk_index)
+        return self.token_to_index.get(token, UNK_INDEX)
 
-    def get_itos(self):
-        return self.index_to_token
+    # Methode, um anhand des Index das originale Token zurückzugeben.
+    def index_to_token_method(self, index): 
+        return self.index_to_token[index]
 
-    def set_default_index(self, index):
-        self.unk_index = index
 
-    def get_index(self, token):
-        return self.token_to_index.get(token, self.unk_index)
-
-    def __contains__(self, token):
-        return token in self.token_to_index
-
-def create_vocab_from_iterator(iterator: Iterator[List[str]], special_tokens: List[str]) -> Vocabulary:
-    vocab = Vocabulary(special_tokens)
-    for tokens in iterator:
-        for token in tokens:
-            vocab.add_token(token)
-    return vocab
-
-def create_tokenizer(text: str, special_chars=r"[^a-zA-Z0-9\s.,?!]"):
+# -------------------------------------------------------------------------------------------------------------------
+# Funktion zum Tokenisieren eines Textes.
+# Sie wandelt den Text in Kleinbuchstaben um, fügt Leerzeichen um Satzzeichen hinzu und zerlegt den Text in einzelne Tokens.
+def create_tokenizer(text):
     text = text.lower()
-    text = re.sub(r"([.,?!])", r" \1 ", text)
-    text = re.sub(special_chars, "", text)
+    text = re.sub(r"([.,?!])", r" \\1 ", text)
     return re.findall(r'\b\w+|\S\b', text)
 
+
+# -------------------------------------------------------------------------------------------------------------------
+# Erzeugt das Vokabular anhand der Datendatei.
+# Dabei werden die Zeilen der Datei tokenisiert und alle Tokens dem Vokabular hinzugefügt.
+def create_vocabulary(config):
+    tokenizer = create_tokenizer
+    special_tokens = ["<pad>", "<unk>", "<sos>", "<eos>"]
+    vocab = Vocabulary(special_tokens)
+
+    with open(config.data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            for token in tokenizer(line.strip()):
+                vocab.add_token(token)
+
+    return tokenizer, vocab
+
+
+# -------------------------------------------------------------------------------------------------------------------
+# TextDataset: Ein Dataset, das aus einer Textdatei Zeile für Zeile liest.
+# Jede Zeile wird tokenisiert und in eine Sequenz von Token-IDs umgewandelt.
 class TextDataset(Dataset):
-    """
-    Dataset, das Zeilen aus einer Textdatei lädt, tokenisiert und in Zahlen übersetzt.
-    """
-    def __init__(self, data_path: str, tokenizer, vocab: Vocabulary, max_seq_length: int):
+    def __init__(self, data_path, tokenizer, vocab, max_seq_length):
         self.tokenizer = tokenizer
         self.vocab = vocab
         self.max_seq_length = max_seq_length
-        self.data_path = data_path
-        self.lines = self._load_lines(data_path)
+        # Lade alle Zeilen der Datendatei in eine Liste
+        self.data = [line.strip() for line in open(data_path, encoding="utf-8")]
 
-    def _load_lines(self, data_path: str) -> List[str]:
-        try:
-            with open(data_path, "r", encoding="utf-8") as f:
-                return [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            logging.error(f"Fehler beim Einlesen der Datei {data_path}: {e}")
-            raise
+    def __getitem__(self, idx):
+        # Tokenisiere die Zeile und wandle jedes Token in seinen Index um
+        tokens = [self.vocab[token] for token in self.tokenizer(self.data[idx])]
+        # Füge den SOS-Token am Anfang und den EOS-Token am Ende hinzu
+        input_ids = [SOS_INDEX] + tokens[:self.max_seq_length] + [EOS_INDEX]
 
-    def __len__(self) -> int:
-        return len(self.lines)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        text = self.lines[idx]
-        tokens = self.tokenizer(text)
-        tokens_ids = [self.vocab[token] for token in tokens]
-
-        # Eingabe (Input)
-        input_ids = [self.vocab["<sos>"]] + tokens_ids
-        input_ids = input_ids[:self.max_seq_length]
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        # Berechne, wie viel Padding benötigt wird, um die maximale Sequenzlänge zu erreichen
         padding_length = self.max_seq_length - len(input_ids)
-        input_ids = F.pad(input_ids, (0, padding_length), value=self.vocab["<pad>"])
+        if padding_length > 0:
+            input_ids += [PAD_INDEX] * padding_length
+        else:
+            input_ids = input_ids[:self.max_seq_length]
 
-        # Ziel (Target)
-        target_ids = tokens_ids + [self.vocab["<eos>"]]
-        target_ids = target_ids[:self.max_seq_length]
-        target_ids = torch.tensor(target_ids, dtype=torch.long)
-        target_padding_length = self.max_seq_length - len(target_ids)
-        target_ids = F.pad(target_ids, (0, target_padding_length), value=self.vocab["<pad>"])
+        # Rückgabe von Eingabe- und Zielsequenz (hier identisch)
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(input_ids, dtype=torch.long)
 
-        return input_ids, target_ids
+    def __len__(self):
+        return len(self.data)
 
-# --------------------------------------------------
-# 4) Trainings- und Evaluierungsfunktionen
-# --------------------------------------------------
-def train_model_epoch(
-    model: nn.Module,
-    train_dataloader: DataLoader,
-    optimizer: optim.Optimizer,
-    criterion,
-    epoch: int,
-    accumulation_steps: int,
-    write_strength: float,
-    clip_value: float
-) -> float:
-    """
-    Führt eine komplette Trainings-Epoche durch mit optionaler Gradientenakkumulation.
-    """
-    model.train()
-    epoch_loss = 0.0
-    progress_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoche {epoch + 1:03d} (Training)")
 
-    for batch_idx, (inputs, targets) in progress_bar:
-        inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
-        outputs, query = model(inputs)
-        loss = criterion(F.log_softmax(outputs, dim=-1).view(-1, outputs.size(-1)), targets.view(-1))
-        loss = loss / accumulation_steps
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
-
-        if (batch_idx + 1) % accumulation_steps == 0:
-            optimizer.step()
-
-            # Memory-Update
-            query_for_memory = model.fc_query_memory(query)
-            query_for_memory = model.fc_query_memory_act(query_for_memory)
-            outputs_for_memory = model.fc_value_memory(outputs)
-            outputs_for_memory = model.fc_value_memory_act(outputs_for_memory)
-
-            query_for_memory = query_for_memory.mean(dim=1)
-            outputs_for_memory = outputs_for_memory.mean(dim=1)
-
-            model.memory.write_as_mean(query_for_memory, outputs_for_memory, write_strength)
-
-        epoch_loss += loss.item()
-        progress_bar.set_postfix({"loss": f"{loss.item() * accumulation_steps:.4f}"})
-
-    avg_epoch_loss = epoch_loss / len(train_dataloader)
-    logger.info(f"Epoche {epoch + 1:03d} Trainingsverlust: {avg_epoch_loss:.4f}")
-    return avg_epoch_loss
-
-def validate_model(model: nn.Module, val_dataloader: DataLoader, criterion) -> float:
-    """
-    Validiert das Modell und gibt den durchschnittlichen Validierungsverlust zurück.
-    """
-    if len(val_dataloader) == 0:
-        print("Keine Validierungsdaten verfügbar. Überspringe Validierung.")
-        logger.warning("Keine Validierungsdaten verfügbar. Überspringe Validierung.")
-        return float('inf')
-
-    model.eval()
-    val_loss = 0.0
-    with torch.no_grad():
-        for val_inputs, val_targets in val_dataloader:
-            val_inputs, val_targets = val_inputs.to(DEVICE), val_targets.to(DEVICE)
-            val_outputs, _ = model(val_inputs)
-            val_loss += criterion(
-                F.log_softmax(val_outputs, dim=-1).view(-1, val_outputs.size(-1)),
-                val_targets.view(-1)
-            ).item()
-
-    avg_val_loss = val_loss / len(val_dataloader)
-    logger.info(f'Validierungsverlust: {avg_val_loss:.4f}')
-    return avg_val_loss
-
-def calculate_metrics(predictions: torch.Tensor, targets: torch.Tensor, pad_index: int) -> Tuple[float, float]:
-    """
-    Berechnet Accuracy und F1-Score und ignoriert dabei Padding-Tokens.
-    """
-    predictions = torch.argmax(predictions, dim=-1)
-    mask = targets != pad_index
-    if not mask.any():
-        return 0.0, 0.0
-
-    masked_targets = targets[mask].cpu().numpy()
-    masked_predictions = predictions[mask].cpu().numpy()
-
-    if DEBUG_MODE:
-        print("Maskierte Ziele (erste 10):", masked_targets[:10])
-        print("Maskierte Vorhersagen (erste 10):", masked_predictions[:10])
-
-    accuracy = accuracy_score(masked_targets, masked_predictions)
-    f1 = f1_score(masked_targets, masked_predictions, average='weighted', zero_division=1)
-    return accuracy, f1
-
-def evaluate_model(model: nn.Module, test_dataloader: DataLoader, criterion, vocab) -> Tuple[float, float, float]:
-    """
-    Testet das Modell auf dem Test-Dataset und berechnet den Durchschnittsverlust,
-    die Genauigkeit und den F1-Score. Speicherschonende Variante, die batchweise akkumuliert.
-    """
-    model.eval()
-    total_batches = len(test_dataloader)
-
-    if total_batches == 0:
-        print("Kein Test-Daten verfügbar.")
-        logger.warning("Kein Test-Daten verfügbar.")
-        return float('inf'), 0.0, 0.0
-
-    total_loss = 0.0
-    total_accuracy = 0.0
-    total_f1 = 0.0
-    total_samples = 0
-
-    with torch.no_grad():
-        for batch_idx, (test_inputs, test_targets) in enumerate(tqdm(test_dataloader, desc="Evaluierung")):
-            test_inputs, test_targets = test_inputs.to(DEVICE), test_targets.to(DEVICE)
-            test_outputs, _ = model(test_inputs)
-
-            # Loss
-            loss = criterion(
-                F.log_softmax(test_outputs, dim=-1).view(-1, test_outputs.size(-1)),
-                test_targets.view(-1)
-            )
+# -------------------------------------------------------------------------------------------------------------------
+# Evaluierungsfunktion für das Modell: Sie berechnet den Verlust, die Genauigkeit und den F1-Score
+# über einen übergebenen DataLoader.
+def evaluate_model(model, dataloader, criterion, device):
+    model.eval()  # Schaltet den Evaluierungsmodus ein (z.B. deaktiviert Dropout)
+    total_loss, total_accuracy, total_f1 = 0, 0, 0
+    with torch.no_grad():  # Keine Gradientenberechnung, um Speicher zu sparen
+        for inputs, targets in dataloader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs, _ = model(inputs)
+            # Berechne den Verlust über die gesamte Batch
+            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
             total_loss += loss.item()
+            # Berechne die Vorhersagen durch Auswahl des Tokens mit der höchsten Wahrscheinlichkeit
+            predictions = torch.argmax(outputs, dim=-1)
+            total_accuracy += accuracy_score(targets.cpu().flatten(), predictions.cpu().flatten())
+            total_f1 += f1_score(targets.cpu().flatten(), predictions.cpu().flatten(), average='weighted', zero_division=1)
 
-            # Batch-Accuracy und Batch-F1
-            batch_accuracy, batch_f1 = calculate_metrics(test_outputs, test_targets, vocab.get_index("<pad>"))
-            batch_size = test_inputs.size(0)
+    # Durchschnittswerte über alle Batches
+    return total_loss / len(dataloader), total_accuracy / len(dataloader), total_f1 / len(dataloader)
 
-            total_accuracy += batch_accuracy * batch_size
-            total_f1 += batch_f1 * batch_size
-            total_samples += batch_size
 
-    avg_test_loss = total_loss / total_batches
-    avg_accuracy = total_accuracy / total_samples if total_samples > 0 else 0.0
-    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0.0
+# -------------------------------------------------------------------------------------------------------------------
+# Funktion zum Plotten und Speichern der Trainings- und Validierungsmetriken.
+def plot_training_history(train_losses, val_losses, val_accuracies, val_f1_scores, plot_path):
+    epochs = range(1, len(train_losses) + 1)
 
-    logger.info(f"Testverlust: {avg_test_loss:.4f}, Testgenauigkeit: {avg_accuracy:.4f}, Test F1-Score: {avg_f1:.4f}")
-    print(f"Testverlust: {avg_test_loss:.4f}, Testgenauigkeit: {avg_accuracy:.4f}, Test F1-Score: {avg_f1:.4f}")
+    plt.figure(figsize=(12, 5))
 
-    return avg_test_loss, avg_accuracy, avg_f1
-
-def create_data_loaders(dataset, batch_size, train_size_ratio, val_size_ratio):
-    total_size = len(dataset)
-    train_size = int(train_size_ratio * total_size)
-    val_size = max(1, int(val_size_ratio * total_size))
-    test_size = total_size - train_size - val_size
-
-    if test_size < 1:
-        test_size = 1
-        train_size -= 1
-    if val_size < 1:
-        val_size = 1
-        train_size -= 1
-
-    logger.info(f"Datensätze Größen: train_size={train_size}, val_size={val_size}, test_size={test_size}")
-
-    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return train_dataloader, val_dataloader, test_dataloader
-
-def load_and_prepare_data(config: Config, tokenizer, vocab):
-    dataset = TextDataset(config.data_path, tokenizer, vocab, config.max_seq_length)
-    train_dataloader, val_dataloader, test_dataloader = create_data_loaders(
-        dataset,
-        config.batch_size,
-        config.train_size_ratio,
-        config.val_size_ratio
-    )
-    return train_dataloader, val_dataloader, test_dataloader
-
-def create_model_and_optimizer(config: Config, vocab_len):
-    model = Controller(
-        config.embedding_dim,
-        config.embedding_dim,
-        vocab_len,
-        config.memory_size,
-        DEVICE
-    ).to(DEVICE)
-
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=1e-6)
-    return model, optimizer, criterion, scheduler
-
-def create_vocabulary(config: Config):
-    tokenizer = lambda text: create_tokenizer(text)
-    special_tokens = ["<pad>", "<unk>", "<sos>", "<eos>"]
-
-    def yield_tokens(file_path: str) -> Iterator[List[str]]:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    yield tokenizer(line.strip())
-        except Exception as e:
-            logger.error(f"Fehler beim Einlesen der Datei: {e}")
-            raise
-
-    vocab = create_vocab_from_iterator(
-        yield_tokens(config.data_path),
-        special_tokens
-    )
-    vocab.set_default_index(vocab["<unk>"])
-    return tokenizer, vocab
-
-def plot_training(train_losses, val_losses, test_accuracies, test_f1_scores):
-    plt.figure(figsize=(12, 6))
-
+    # Plot für Verlustwerte
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Trainingsverlust')
-    plt.plot(val_losses, label='Validierungsverlust')
-    plt.xlabel('Epoche')
+    plt.plot(epochs, train_losses, 'b-', label='Trainingsverlust')
+    plt.plot(epochs, val_losses, 'r-', label='Validierungsverlust')
+    plt.title('Trainings- und Validierungsverlust')
+    plt.xlabel('Epochen')
     plt.ylabel('Verlust')
     plt.legend()
-    plt.title('Trainings- und Validierungsverlust')
 
+    # Plot für Genauigkeit und F1-Score
     plt.subplot(1, 2, 2)
-    plt.plot(test_accuracies, label='Testgenauigkeit')
-    plt.plot(test_f1_scores, label='Test F1-Score')
-    plt.xlabel('Epoche')
-    plt.ylabel('Metrik')
+    plt.plot(epochs, val_accuracies, 'b-', label='Validierungsgenauigkeit')
+    plt.plot(epochs, val_f1_scores, 'r-', label='Validierungs-F1-Score')
+    plt.title('Validierungsgenauigkeit und F1-Score')
+    plt.xlabel('Epochen')
+    plt.ylabel('Score')
     plt.legend()
-    plt.title('Testgenauigkeit und F1-Score')
 
     plt.tight_layout()
-    plt.show()
+    plot_filename = os.path.join(plot_path, "training_metrics.png")
+    plt.savefig(plot_filename)
+    plt.close()
+    print(f"Trainingsplots gespeichert in: {plot_filename}")
 
-def setup_training(config: Config, tokenizer, vocab):
-    model, optimizer, criterion, scheduler = create_model_and_optimizer(config, len(vocab))
-    train_dataloader, val_dataloader, test_dataloader = load_and_prepare_data(config, tokenizer, vocab)
-    return model, optimizer, criterion, scheduler, train_dataloader, val_dataloader, test_dataloader
 
-def run_training_loop(
-    model: nn.Module,
-    config: Config,
-    optimizer: optim.Optimizer,
-    criterion,
-    scheduler: optim.lr_scheduler,
-    train_dataloader: DataLoader,
-    val_dataloader: DataLoader,
-    test_dataloader: DataLoader,
-    vocab
-) -> Tuple[List[float], List[float], List[float], List[float]]:
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    patience = config.patience
-    save_path = Path(config.save_path)
-    save_path.mkdir(parents=True, exist_ok=True)
+# -------------------------------------------------------------------------------------------------------------------
+# Trainingsfunktion: Hier werden Datensatz, Model, Optimierer und Verlustfunktion erstellt.
+# Anschließend wird das Modell trainiert, validiert und der Modellzustand nach jeder Epoche gespeichert.
+def train_model(config):
+    # Erzeuge Tokenizer und Vokabular basierend auf der Datendatei
+    tokenizer, vocab = create_vocabulary(config)
+    dataset = TextDataset(config.data_path, tokenizer, vocab, config.max_seq_length)
+    # Aufteilen des Datensatzes in Training, Validierung und Test
+    train_size = int(config.train_size_ratio * len(dataset))
+    val_size = int(config.val_size_ratio * len(dataset))
+    test_size = len(dataset) - train_size - val_size
 
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+
+    # Modellinitialisierung
+    model = Controller(config.embedding_dim, config.memory_size, len(vocab), config.device).to(config.device)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    start_epoch = 0
+    model_path = os.path.join(config.save_path, "model.pth")
+
+    # Optional: Laden eines bereits gespeicherten Modells, falls load_model aktiviert ist.
+    if config.load_model and os.path.exists(model_path):
+        try:
+            checkpoint = torch.load(model_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"Modell von Epoche {start_epoch} geladen. Training wird fortgesetzt.")
+        except Exception as e:
+            print(f"Fehler beim Laden des Modells: {e}. Training startet von neuem.")
+            start_epoch = 0
+
+    # Listen zur Speicherung der Trainings- und Validierungsmesswerte
     train_losses = []
     val_losses = []
-    test_accuracies = []
-    test_f1_scores = []
+    val_accuracies = []
+    val_f1_scores = []
 
-    for epoch in range(config.epochs):
-        try:
-            logger.info(f"Epoche {epoch + 1} gestartet.")
-            train_loss = train_model_epoch(
-                model,
-                train_dataloader,
-                optimizer,
-                criterion,
-                epoch,
-                accumulation_steps=config.accumulation_steps,
-                write_strength=config.write_strength,
-                clip_value=1.0
-            )
+    # Training über die definierte Anzahl von Epochen
+    for epoch in range(start_epoch, config.epochs):
+        model.train()  # Schalte den Trainingsmodus ein
+        epoch_loss = 0.0
+        # Verwende tqdm für eine übersichtliche Fortschrittsanzeige pro Epoche
+        with tqdm(train_loader, desc=f"Epoche {epoch + 1}/{config.epochs} (Training)") as t:
+            for inputs, targets in t:
+                inputs, targets = inputs.to(config.device), targets.to(config.device)
+                optimizer.zero_grad()  # Gradienten zurücksetzen
+                outputs, _ = model(inputs)
+                loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+                loss.backward()  # Backpropagation
+                optimizer.step()  # Aktualisiere die Modellparameter
+                epoch_loss += loss.item()
+                t.set_postfix(loss=epoch_loss / len(train_loader))
 
-            val_loss = validate_model(model, val_dataloader, criterion)
-            if val_loss == float('inf'):
-                logger.warning("Validierung wurde übersprungen.")
-            else:
-                scheduler.step()
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    # Wir merken uns den aktuellen State
-                    best_model_state = model.state_dict()
-                    epochs_no_improve = 0
-                    torch.save(model.state_dict(), save_path / f"memory_model_epoch_{epoch + 1}.pth")
-                else:
-                    epochs_no_improve += 1
+        train_losses.append(epoch_loss / len(train_loader))
 
-                if epochs_no_improve > patience:
-                    logger.info("Vorzeitiger Abbruch ausgelöst (Early Stopping).")
-                    print("Training wird vorzeitig abgebrochen.")
-                    break
+        # Evaluierung auf dem Validierungsdatensatz
+        val_loss, val_accuracy, val_f1 = evaluate_model(model, val_loader, criterion, config.device)
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
+        val_f1_scores.append(val_f1)
 
-            # Neue, speicherschonende Evaluierung
-            test_loss, accuracy, f1 = evaluate_model(model, test_dataloader, criterion, vocab)
+        print(f"Epoche {epoch + 1}/{config.epochs} (Validierung) - Verlust: {val_loss:.4f}, Genauigkeit: {val_accuracy:.4f}, F1-Score: {val_f1:.4f}")
 
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            test_accuracies.append(accuracy)
-            test_f1_scores.append(f1)
+        # Speichern des Modells nach jeder Epoche
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': epoch_loss / len(train_loader),
+        }, model_path)
+        print(f"Modell gespeichert in: {model_path}")
 
-        except Exception as e:
-            logger.error(f"Fehler in Epoche {epoch}: {e}")
-            print(f"Fehler in Epoche {epoch}: {e}")
-            break
+    # Speichern und Plotten der Trainingsverläufe
+    plot_training_history(train_losses, val_losses, val_accuracies, val_f1_scores, config.plot_path)
 
-    # Letzte Evaluation nach dem Training
-    test_loss, accuracy, f1 = evaluate_model(model, test_dataloader, criterion, vocab)
-    return train_losses, val_losses, test_accuracies, test_f1_scores
+    # Abschließende Evaluierung auf dem Testdatensatz
+    test_loss, test_accuracy, test_f1 = evaluate_model(model, test_loader, criterion, config.device)
+    print("\n--- Testergebnisse ---")
+    print(f"Verlust auf Test-Set: {test_loss:.4f}, Genauigkeit: {test_accuracy:.4f}, F1-Score: {test_f1:.4f}")
 
-def save_best_model(
-    config: Config,
-    model: nn.Module,
-    vocab,
-    train_losses: List[float],
-    val_losses: List[float],
-    test_accuracies: List[float],
-    test_f1_scores: List[float]
-):
-    config_to_save = config.save_config()
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'vocab': vocab,
-        'config': config_to_save
-    }, Path(config.save_path) / "memory_model.pth")
-    logger.info("Bestes Modell und Vokabular erfolgreich gespeichert!")
-    print("Bestes Modell erfolgreich gespeichert.")
 
-# --------------------------------------------------
-# 5) Optuna-Objective und Haupt-Trainingsfunktion
-# --------------------------------------------------
-def objective(trial: optuna.Trial, config: Config) -> float:
-    # Hyperparameter definieren
-    # (Ab Optuna 3.0: prefer suggest_float(..., log=True) anstelle von suggest_loguniform)
-    config.embedding_dim = trial.suggest_int('embedding_dim', 128, 2048, step=128)
-    config.memory_size = trial.suggest_int('memory_size', 256, 4096, step=256)
-    config.learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
-    config.batch_size = trial.suggest_categorical('batch_size', [8, 16, 32, 64])
-    config.accumulation_steps = trial.suggest_int('accumulation_steps', 1, 10)
-    config.epochs = trial.suggest_int('epochs', 50, 200, step=50)
-    config.write_strength = trial.suggest_float('write_strength', 0.01, 0.1, log=True)
+# -------------------------------------------------------------------------------------------------------------------
+# Funktion zur Textgenerierung:
+# Basierend auf einem gegebenen Prompt wird mit dem trainierten Modell eine Textsequenz generiert.
+def generate_text(model, vocab, tokenizer, device, prompt_text, max_tokens=30):
+    """Generiert Text basierend auf einem Prompt mit dem trainierten Modell."""
+    model.eval()  # Schalte in den Evaluationsmodus (z.B. deaktiviert Dropout)
+    # Tokenisierung des Prompts und Umwandlung in Token-IDs
+    tokens = [vocab[token] for token in tokenizer(prompt_text)]
+    # Erstellen des Input-Tensors; füge den SOS-Token hinzu und kürze auf die maximale Länge
+    input_tensor = torch.tensor([([SOS_INDEX] + tokens)[:CONFIG.max_seq_length]], dtype=torch.long).to(device)
 
-    # Setup
-    tokenizer, vocab = create_vocabulary(config)
-    model, optimizer, criterion, scheduler, train_dataloader, val_dataloader, test_dataloader = setup_training(config, tokenizer, vocab)
+    generated_tokens = []
 
-    # Trainingsloop
-    train_losses, val_losses, test_accuracies, test_f1_scores = run_training_loop(
-        model,
-        config,
-        optimizer,
-        criterion,
-        scheduler,
-        train_dataloader,
-        val_dataloader,
-        test_dataloader,
-        vocab
-    )
+    with torch.no_grad():  # Keine Gradientenberechnung während der Generierung
+        for _ in range(max_tokens):
+            outputs, _ = model(input_tensor)
+            # Betrachte nur das letzte Token des Outputs, um den nächsten Token vorherzusagen
+            next_token_probs = F.softmax(outputs[:, -1, :], dim=-1)
+            # Sampling anstatt argmax: Dies erlaubt eine variablere und kreativere Textgenerierung
+            next_token_index = torch.multinomial(next_token_probs, num_samples=1).item()
 
-    best_val_loss = min(val_losses) if len(val_losses) > 0 else float('inf')
-    return best_val_loss
+            # Stoppe die Generierung, wenn das EOS-Token erreicht wird
+            if next_token_index == EOS_INDEX:
+                break
 
-def train_model(config: Config):
-    print("train_model() gestartet.")
-    logger.info("train_model() gestartet.")
+            generated_tokens.append(next_token_index)
+            # Hänge das vorhergesagte Token an den Input an, um Kontext für die nächste Vorhersage zu liefern
+            input_tensor = torch.cat((input_tensor, torch.tensor([[next_token_index]], dtype=torch.long).to(device)), dim=1)
+            # Beende die Schleife, falls die maximale Sequenzlänge erreicht ist
+            if input_tensor.size(1) >= CONFIG.max_seq_length:
+                break
 
-    # Optuna-Studie erstellen
-    study = optuna.create_study(direction='minimize')
-    study.optimize(lambda trial: objective(trial, config), n_trials=50, n_jobs=1, timeout=3600)
+    # Dekodiere die generierten Token zurück in lesbaren Text mithilfe der Methode im Vokabular
+    generated_text_tokens_decoded = [vocab.index_to_token_method(token) for token in generated_tokens]
+    generated_text = " ".join(generated_text_tokens_decoded)
+    return generated_text
 
-    # Beste Hyperparameter
-    print("Beste Hyperparameter: ", study.best_params)
-    logger.info(f"Beste Hyperparameter: {study.best_params}")
 
-    # Übernahme der besten Parameter ins Config-Objekt
-    config.load_config(study.best_params)
-
-    # Finale Trainingsschleife mit den besten Parametern
-    tokenizer, vocab = create_vocabulary(config)
-    model, optimizer, criterion, scheduler, train_dataloader, val_dataloader, test_dataloader = setup_training(config, tokenizer, vocab)
-
-    train_losses, val_losses, test_accuracies, test_f1_scores = run_training_loop(
-        model,
-        config,
-        optimizer,
-        criterion,
-        scheduler,
-        train_dataloader,
-        val_dataloader,
-        test_dataloader,
-        vocab
-    )
-
-    # Speichern des besten Modells
-    save_best_model(config, model, vocab, train_losses, val_losses, test_accuracies, test_f1_scores)
-    # Visualisierung
-    plot_training(train_losses, val_losses, test_accuracies, test_f1_scores)
-
-    print("train_model() abgeschlossen.")
-    logger.info("train_model() abgeschlossen.")
-
-# --------------------------------------------------
-# 6) Hauptausführung
-# --------------------------------------------------
+# -------------------------------------------------------------------------------------------------------------------
+# Hauptprogramm: Der Einstiegspunkt des Skripts.
 if __name__ == "__main__":
-    # Startet den Trainingsprozess
+    # Konfiguration initialisieren: Hier wird z.B. die Anzahl der Epochen festgelegt und ob ein Modell geladen werden soll.
+    CONFIG = Config(epochs=15, load_model=True)
     train_model(CONFIG)
 
-    # --- Beispiel: Trainiertes Modell laden und verwenden ---
-    """
-    Falls Sie nach dem Training mit den besten Parametern Ihr Modell
-    in einer echten Anwendung nutzen möchten, denken Sie daran,
-    es samt Vokabular und Config zu laden.
+    # Nach dem Training wird das Modell getestet und einige Beispiel-Queries zur Textgenerierung durchgeführt.
+    tokenizer, vocab = create_vocabulary(CONFIG)  # Erstelle Vokabular und Tokenizer neu, um auf dem aktuellen Stand zu sein
+    model = Controller(CONFIG.embedding_dim, CONFIG.memory_size, len(vocab), CONFIG.device).to(CONFIG.device)  # Initialisiere das Modell
+    model_path = os.path.join(CONFIG.save_path, "model.pth")
+    checkpoint = torch.load(model_path)  # Lade den gespeicherten Modellzustand
+    model.load_state_dict(checkpoint['model_state_dict'])  # Setze die Modellparameter
 
-    Beispiel:
-    --------
-    checkpoint = torch.load("memory_model.pth")  # Pfad anpassen, falls nötig
-    best_config = checkpoint['config']
-    best_vocab = checkpoint['vocab']
+    # Definierte Beispiel-Queries, die vom Modell bearbeitet werden sollen
+    queries = [
+        "Verordnung (EU) 2024/1689 DES EUROPÄISCHEN PARLAMENTS UND DES RATES",
+        "Zweck dieser Verordnung ist es",
+        "KI-Systeme können problemlos in verschiedenen Bereichen der Wirtschaft und Gesellschaft,",
+        "Diese Verordnung sollte im Einklang mit den in der Charta verankerten Werten der Union angewandt werden,"
+    ]
 
-    # Modell neu instanziieren und Gewichte laden
-    best_model = Controller(
-        best_config['embedding_dim'],
-        best_config['embedding_dim'],
-        len(best_vocab),
-        best_config['memory_size'],
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    best_model.load_state_dict(checkpoint['model_state_dict'])
-    best_model.eval()
-
-    # Anschließend können Sie das Modell z. B. wie folgt nutzen:
-    # (1) Input vorbereiten
-    # (2) Vorhersage berechnen
-    # (3) Ausgabe interpretieren
-    """
+    print("\n--- Modell-Queries und Generierungen ---")
+    for query in queries:
+        generated_response = generate_text(model, vocab, tokenizer, CONFIG.device, query)
+        print(f"Query: '{query}'")
+        print(f"Generierte Antwort: '{generated_response}'\n")
