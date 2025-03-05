@@ -1,4 +1,5 @@
 # DRLMemNet: Ein Deep Learning Modell mit differenzierbarem Speicher
+![logo](https://github.com/user-attachments/assets/062c199e-686a-4de4-bf62-78d6302cc364)
 
 ## Beschreibung
 
